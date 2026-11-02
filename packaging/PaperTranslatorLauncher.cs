@@ -15,13 +15,13 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("橙意翻译助手")]
 [assembly: AssemblyProduct("橙意翻译助手")]
 [assembly: AssemblyDescription("PDFMathTranslate 与百度学术翻译桌面助手")]
-[assembly: AssemblyVersion("0.3.1.0")]
-[assembly: AssemblyFileVersion("0.3.1.0")]
+[assembly: AssemblyVersion("0.3.2.0")]
+[assembly: AssemblyFileVersion("0.3.2.0")]
 
 internal static class PaperTranslatorLauncher
 {
     private const string ProductName = "橙意翻译助手";
-    private const string ProductVersion = "0.3.1";
+    private const string ProductVersion = "0.3.2";
     private const string ApplicationId = "paper-translator-desktop";
     private static readonly string DataDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PaperTranslator");

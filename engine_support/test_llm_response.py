@@ -82,11 +82,13 @@ class LLMResponseTests(unittest.TestCase):
         attempts = []
         def handler(query):
             attempts.append(query)
-            translated = TOKEN_RE.sub('', query) if len(attempts) == 1 else query.replace('Our', '我们的')
-            return {'trans_result': [{'src': query, 'dst': translated}]}
+            if len(attempts) == 1:
+                return {'trans_result': [{'src': query, 'dst': TOKEN_RE.sub('', query)}]}
+            return {'trans_result': [{'src': line, 'dst': line.replace('Our', '我们的')}
+                                     for line in query.split('\n')]}
         client, session = self.client(handler)
         self.assertEqual(client.translate('Our EEGNet works.'), '我们的 EEGNet works.')
-        self.assertEqual(len(session.calls), 3)
+        self.assertEqual(len(session.calls), 2)
         self.assertEqual(client.stats['protection_retries'], 1)
         self.assertEqual(client.stats['fragment_recoveries'], 1)
         self.assertEqual(client.errors, [])
@@ -108,8 +110,9 @@ class LLMResponseTests(unittest.TestCase):
 
     def test_more_than_forty_fragments_are_all_recovered_and_terms_remain_english(self):
         def handler(query):
-            translated = TOKEN_RE.sub('', query) if TOKEN_RE.search(query) else '译文' + query
-            return {'trans_result': [{'src': query, 'dst': translated}]}
+            if TOKEN_RE.search(query):
+                return {'trans_result': [{'src': query, 'dst': TOKEN_RE.sub('', query)}]}
+            return {'trans_result': [{'src': line, 'dst': '译文' + line} for line in query.split('\n')]}
         client, session = self.client(handler)
         source = ' '.join(f'Segment {index} EEGNet' for index in range(64)) + ' final fragment.'
         expected = ' '.join(f'译文Segment {index} EEGNet' for index in range(64)) + ' 译文final fragment.'
@@ -117,12 +120,12 @@ class LLMResponseTests(unittest.TestCase):
         self.assertEqual(result, expected)
         self.assertEqual(result.count('EEGNet'), 64)
         self.assertFalse(TOKEN_RE.search(result))
-        self.assertEqual(len(session.calls), 66)  # One full request, then all 65 plain-text fragments.
+        self.assertEqual(len(session.calls), 2)  # One full request, then one verified 65-fragment batch.
         self.assertTrue(all(not TOKEN_RE.search(request['json']['q']) for _, request in session.calls[1:]))
         self.assertEqual(client.stats['fragment_recoveries'], 1)
         self.assertEqual(client.errors, [])
         self.assertEqual(client.translate(source), expected)
-        self.assertEqual(len(session.calls), 66)
+        self.assertEqual(len(session.calls), 2)
         self.assertEqual(client.stats['cache_hits'], 1)
 
     def test_quota_failure_during_many_fragment_recovery_stops_remaining_requests(self):
@@ -143,10 +146,11 @@ class LLMResponseTests(unittest.TestCase):
         self.assertEqual(client.cache.connection.execute('SELECT count(*) FROM translations').fetchone()[0], 0)
 
     def test_unchanged_english_fragment_recovery_is_rejected_without_cache(self):
-        client, session = self.client(lambda q: {'trans_result': [{'src': q, 'dst': TOKEN_RE.sub('', q)}]})
+        client, session = self.client(lambda q: {'trans_result': [
+            {'src': line, 'dst': TOKEN_RE.sub('', line)} for line in q.split('\n')]})
         with self.assertRaises(ProtectionError):
             client.translate('Our EEGNet is a method. ' * 3)
-        self.assertEqual(len(session.calls), 5)
+        self.assertEqual(len(session.calls), 5)  # Split once more to verify the unchanged singleton fails too.
         self.assertEqual(client.cache.connection.execute('SELECT count(*) FROM translations').fetchone()[0], 0)
 
     def test_old_cli_cache_is_never_reused_as_complete_translation(self):

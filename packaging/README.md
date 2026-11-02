@@ -2,7 +2,7 @@
 
 The installer targets Windows 10/11 x64. It bundles a relocatable CPython 3.12 runtime, the installed PDFMathTranslate dependencies, the PDFMathTranslate source tree, and the BabelDOC fonts/layout model/CMaps/tiktoken assets. No Python installation or developer machine path is required after installation.
 
-## 0.3.1 构建输入
+## 0.3.2 构建输入
 
 构建在 Windows x64 上进行，使用 Python 3.12、Windows 自带的 .NET Framework C# 编译器和 Inno Setup 6.4.3 或兼容版本。生产运行环境与开发虚拟环境分开：虚拟环境本身包含指向系统 Python 的路径，不能直接作为独立运行环境分发。
 
@@ -34,11 +34,13 @@ $env:BABELDOC_CACHE_DIR = Join-Path $PWD 'packaging\deps\babeldoc'
 .\packaging\build.ps1
 ```
 
-已有 `build/payload/` 时使用 `-SkipPrepare` 复用运行环境，但会重新同步应用、引擎、UI 与兼容补丁。`-PrepareOnly` 只准备环境并编译启动器。完整安装包输出到 `dist/ChengyiTranslationAssistant-0.3.1-Windows-x64-Setup.exe`。
+已有 `build/payload/` 时使用 `-SkipPrepare` 复用运行环境，但会重新同步应用、引擎、UI 与兼容补丁。`-PrepareOnly` 只准备环境并编译启动器。完整安装包输出到 `dist/ChengyiTranslationAssistant-0.3.2-Windows-x64-Setup.exe`。
 
 `patch_runtime.py` 固定检查 BabelDOC 0.6.4；可读的排版修补源码在 `patches/`，其上游许可随源码与安装目录保留。百度新 Key 模式直接通过 HTTPS 读取官方接口的全部结果，不需要 `trans.exe`。
 
 升级保留原 AppId 与 `%LOCALAPPDATA%\PaperTranslator`。安装器调用独立启动器的升级模式，仅处理其安装目录中身份和命令行均匹配的服务；发现仍在翻译或排队时会阻止升级，避免中断用户任务。开发者打包前也应结束自己启动的本地调试进程。
+
+0.3.2 的速度优化位于应用与 `engine_support/` 源码中，无需替换运行环境或重新下载模型。复用 payload 时仍须同步这些源码和前端资源，并重新编译版本为 0.3.2 的启动器。沿用原图标、安装目录和用户数据目录，已有完整译文缓存继续复用。
 
 ## Payload layout
 

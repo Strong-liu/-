@@ -7,6 +7,7 @@ import base64
 import ctypes
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -200,6 +201,61 @@ def kill_owned_process(process):
     process.wait(timeout=15)
 
 
+class EngineWatchdog:
+    """Bound a silent engine hang without limiting the length of a live job."""
+
+    def __init__(self, process, silence_seconds=180):
+        self.process = process
+        self.silence_seconds = silence_seconds
+        self.last_activity = time.monotonic()
+        self.timed_out = threading.Event()
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self.watch, daemon=True, name='engine-watchdog')
+
+    def touch(self):
+        self.last_activity = time.monotonic()
+
+    def check(self):
+        if self.process.poll() is not None:
+            return False
+        if time.monotonic() - self.last_activity < self.silence_seconds:
+            return False
+        self.timed_out.set()
+        kill_owned_process(self.process)
+        return True
+
+    def watch(self):
+        while not self.done.wait(5):
+            if self.check():
+                return
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.done.set()
+        self.thread.join()
+
+
+def finite_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
+def engine_telemetry(event):
+    # Only operational counters reach the API or disk; never persist an
+    # arbitrary payload from an upstream response in task status.
+    counters = ('requests', 'cache_hits', 'translated_paragraphs', 'preserved_paragraphs',
+                'fragment_recoveries', 'active_requests', 'last_activity_seconds',
+                'elapsed_seconds', 'retries')
+    stats = event.get('stats', {})
+    source = (stats if isinstance(stats, dict) else {}) | {key: event[key] for key in counters if key in event}
+    values = {key: source[key] for key in counters if finite_number(source.get(key))}
+    code = event.get('last_retry_code', source.get('last_retry_code'))
+    if isinstance(code, (str, int)) and re.fullmatch(r'[\w .:-]{1,80}', str(code)):
+        values['last_retry_code'] = str(code)
+    return values
+
+
 class Manager:
     def __init__(self):
         self.lock = threading.RLock()
@@ -207,6 +263,8 @@ class Manager:
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pdf-translation')
         self.stopping = threading.Event()
         self.process = None
+        self.process_job_id = None
+        self.cancel_requested = set()
 
     def load(self):
         JOBS.mkdir(parents=True, exist_ok=True)
@@ -252,15 +310,39 @@ class Manager:
             # an older client or saved task still submits the former opt-out.
             policy.update(terms=clean_terms(values.terms), preserve_references=True)
             self.update(identifier, terms=policy['terms'], policy=policy, preserve_references=True,
-                        status='queued', phase='queued', message='已加入队列，等待处理。', started_at=None, finished_at=None)
+                        status='queued', phase='queued', message='已加入队列，等待处理。', started_at=None, finished_at=None,
+                        stage_current=None, stage_total=None, overall_progress=None, telemetry={}, last_activity_at=None)
+            self.cancel_requested.discard(identifier)
             self.executor.submit(self.run, identifier)
             return self.public(job)
 
+    def cancel(self, identifier):
+        with self.lock:
+            job = self.items[identifier]
+            if job['status'] not in ('queued', 'running'):
+                raise HTTPException(409, '此任务没有在运行。')
+            if job['status'] == 'queued':
+                self.update(identifier, status='failed', phase='cancelled',
+                            message='已取消排队，可随时重新翻译。', finished_at=time.time())
+                return self.public(job)
+            self.cancel_requested.add(identifier)
+            self.update(identifier, phase='cancelling', message='正在停止翻译请求并保留已完成的缓存……')
+            process = self.process if self.process_job_id == identifier else None
+        if process is not None:
+            kill_owned_process(process)
+        with self.lock:
+            return self.public(self.items[identifier])
+
     def run(self, identifier):
+        with self.lock:
+            # A cancelled queue item can remain in ThreadPoolExecutor's
+            # work queue; it must never start a translator later.
+            if self.items[identifier]['status'] != 'queued':
+                return
+            self.update(identifier, status='running', phase='preparing', message='正在准备内置字体和版面模型……', started_at=time.time())
         folder = JOBS / identifier
         output = folder / 'output'
         output.mkdir(exist_ok=True)
-        self.update(identifier, status='running', phase='preparing', message='正在准备内置字体和版面模型……', started_at=time.time())
         credentials = {}
         try:
             prepare_assets()
@@ -280,21 +362,29 @@ class Manager:
             errors = []
             self.update(identifier, phase='translating', message='正在分析 PDF、保护英文专名并进行百度学术翻译……')
             with (folder / 'translation.log').open('w', encoding='utf-8', buffering=1) as log:
+                with self.lock:
+                    if identifier in self.cancel_requested or self.stopping.is_set():
+                        raise RuntimeError('已取消翻译，已完成的缓存会保留，可随时重试。')
                 process = subprocess.Popen(command, cwd=ROOT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                            text=True, encoding='utf-8', errors='replace', creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-                self.process = process
-                timer = threading.Timer(7200, lambda: kill_owned_process(process))
-                timer.daemon = True
-                timer.start()
+                with self.lock:
+                    self.process = process
+                    self.process_job_id = identifier
+                    cancelled = identifier in self.cancel_requested
+                if cancelled:
+                    kill_owned_process(process)
+                watchdog = EngineWatchdog(process)
+                watchdog.start()
                 try:
                     for line in process.stdout:
+                        watchdog.touch()
                         safe_line = line
                         for value in credentials.values():
                             safe_line = safe_line.replace(value, '[REDACTED]')
                         log.write(safe_line)
-                        if self.stopping.is_set():
+                        if self.stopping.is_set() or identifier in self.cancel_requested:
                             kill_owned_process(process)
-                            raise RuntimeError('任务已被关闭，可重新启动后重试。')
+                            raise RuntimeError('已取消翻译，已完成的缓存会保留，可随时重试。')
                         if 'PDFMT_EVENT ' in line:
                             try:
                                 event = json.loads(line.split('PDFMT_EVENT ', 1)[1])
@@ -305,18 +395,30 @@ class Manager:
                                 finish = event
                             elif kind == 'error':
                                 errors.append(event.get('message', event.get('error', '翻译引擎返回错误。')))
+                            elif kind == 'telemetry':
+                                telemetry = self.items[identifier].get('telemetry', {}) | engine_telemetry(event)
+                                self.update(identifier, telemetry=telemetry, last_activity_at=time.time())
+                                if telemetry.get('last_activity_seconds', 0) >= 300:
+                                    raise RuntimeError('连续 5 分钟没有翻译请求或 PDF 处理进展，已停止任务。已完成的缓存会保留，请检查网络或百度服务后重试。')
                             elif kind in ('progress_start', 'progress_update', 'progress_end'):
                                 stage = str(event.get('stage', event.get('name', '')))
                                 if stage:
-                                    self.update(identifier, phase=stage, message='正在处理：' + stage)
+                                    progress = {key: event[key] for key in ('stage_current', 'stage_total', 'stage_progress', 'overall_progress')
+                                                if finite_number(event.get(key))}
+                                    self.update(identifier, phase=stage, message='正在处理：' + stage,
+                                                last_activity_at=time.time(), **progress)
                     process.wait()
+                    if watchdog.timed_out.is_set():
+                        raise RuntimeError('翻译引擎连续 180 秒没有心跳或进度，已停止任务。已完成的缓存会保留，请重试。')
+                    if identifier in self.cancel_requested:
+                        raise RuntimeError('已取消翻译，已完成的缓存会保留，可随时重试。')
                 except Exception:
                     # A failed status update must not leave an invisible
                     # translator running or spending API quota in the background.
                     kill_owned_process(process)
                     raise
                 finally:
-                    timer.cancel()
+                    watchdog.stop()
                     if process.stdout:
                         process.stdout.close()
             mono = output / 'input.no_watermark.zh-CN.mono.pdf'
@@ -330,8 +432,11 @@ class Manager:
                 text = ''.join(page.get_text() for page in chinese)
                 if TOKEN_RE.search(text) or re.search(r'\{\s*v\s*\d+\s*\}|<style\b|PDFMTPROTECT\d+', text):
                     raise RuntimeError('译文中存在未恢复的标记，请查看日志。')
-            self.update(identifier, status='succeeded', phase='finished', message='翻译完成，英文专名已按术语清单保护。',
-                        mono_file=mono.name, dual_file=dual.name, finished_at=time.time())
+            with self.lock:
+                if identifier in self.cancel_requested:
+                    raise RuntimeError('已取消翻译，已完成的缓存会保留，可随时重试。')
+                self.update(identifier, status='succeeded', phase='finished', message='翻译完成，英文专名已按术语清单保护。',
+                            mono_file=mono.name, dual_file=dual.name, finished_at=time.time())
         except Exception as error:
             message = str(error)
             for value in credentials.values():
@@ -339,9 +444,14 @@ class Manager:
             LOGGER.error('任务 %s 失败：%s', identifier, message)
             if isinstance(error, PermissionError):
                 message = '保存任务进度时文件被占用或无法写入，请稍后重试；已完成的翻译缓存会保留。'
-            self.update(identifier, status='failed', phase='failed', message=message, finished_at=time.time())
+            self.update(identifier, status='failed', phase='cancelled' if identifier in self.cancel_requested else 'failed',
+                        message=message, finished_at=time.time())
         finally:
-            self.process = None
+            with self.lock:
+                if self.process_job_id == identifier:
+                    self.process = None
+                    self.process_job_id = None
+                self.cancel_requested.discard(identifier)
 
     def close(self):
         self.stopping.set()
@@ -382,7 +492,7 @@ def home():
 def health():
     with manager.lock:
         active_jobs = sum(item['status'] in ('running', 'queued') for item in manager.items.values())
-    return {'app': APP_ID, 'version': '0.3.1', 'product': '橙意翻译助手', 'service': settings.public()['service'],
+    return {'app': APP_ID, 'version': '0.3.2', 'product': '橙意翻译助手', 'service': settings.public()['service'],
             'ready': BOOTSTRAP.is_file() and PYTHON.is_file(), 'active_jobs': active_jobs}
 
 
@@ -507,6 +617,12 @@ def start_job(identifier: str, values: StartInput):
 def retry_job(identifier: str):
     job = get_job(identifier)
     return manager.queue(identifier, StartInput(terms=job['terms'], preserve_references=job['preserve_references']))
+
+
+@app.post('/api/jobs/{identifier}/cancel', status_code=202)
+def cancel_job(identifier: str):
+    get_job(identifier)
+    return manager.cancel(identifier)
 
 
 @app.get('/api/jobs/{identifier}/download/{kind}')

@@ -145,8 +145,11 @@ class TranslationCache:
             return row[0] if row else None
 
     def set(self, key, translation):
+        self.set_many([(key, translation)])
+
+    def set_many(self, values):
         with self.lock:
-            self.connection.execute('INSERT OR REPLACE INTO translations(cache_key,value) VALUES (?,?)', (key, translation))
+            self.connection.executemany('INSERT OR REPLACE INTO translations(cache_key,value) VALUES (?,?)', values)
             self.connection.commit()
 
     def close(self):
@@ -154,7 +157,7 @@ class TranslationCache:
             self.connection.close()
 
 
-def parse_complete_llm_response(payload, query):
+def parse_complete_llm_response(payload, query, *, return_records=False):
     """Reject missing/reordered source records, empty translations or truncation.
 
     The official API may split even a very short input into several records.
@@ -174,7 +177,43 @@ def parse_complete_llm_response(payload, query):
         raise BaiduAPIError('EMPTY_TRANSLATION', '百度服务遗漏了部分译文，本段译文已拒绝')
     # No extra punctuation or paragraph breaks: record boundaries are an API
     # implementation detail and do not represent source paragraph boundaries.
-    return ''.join(item['dst'] for item in records)
+    return records if return_records else ''.join(item['dst'] for item in records)
+
+
+def align_fragment_records(records, fragments):
+    """Map response records to source spans only at verified source boundaries.
+
+    The service may split a span into sentences. It may also merge several
+    input lines into one record; that record cannot safely be divided by its
+    Chinese output length or punctuation, so the caller must split the batch.
+    """
+    compact = lambda text: re.sub(r'\s+', '', text)
+    index = 0
+    translated = []
+    for fragment in fragments:
+        expected = compact(fragment)
+        consumed = ''
+        parts = []
+        while consumed != expected:
+            if index >= len(records):
+                raise BaiduAPIError('BATCH_ALIGNMENT', '批量译文与原文片段边界不匹配')
+            record = records[index]
+            index += 1
+            source = compact(record['src'])
+            # Empty source must not be used to inject unassigned translated
+            # text between records, including before the first source span.
+            if not source:
+                if record['dst'].strip():
+                    raise BaiduAPIError('BATCH_ALIGNMENT', '批量译文包含无法对应的记录')
+                continue
+            consumed += source
+            if not expected.startswith(consumed):
+                raise BaiduAPIError('BATCH_ALIGNMENT', '批量译文跨越了原文片段边界')
+            parts.append(record['dst'])
+        translated.append(''.join(parts).strip())
+    if any(compact(record['src']) or record['dst'].strip() for record in records[index:]):
+        raise BaiduAPIError('BATCH_ALIGNMENT', '批量译文包含多余记录')
+    return translated
 
 
 class BaiduAcademicClient:
@@ -192,11 +231,52 @@ class BaiduAcademicClient:
         self.fatal_error = None
         self.counter_lock = threading.Lock()
         self.stats = {'requests': 0, 'cache_hits': 0, 'preserved_paragraphs': 0, 'translated_paragraphs': 0,
-                      'protection_retries': 0, 'fragment_recoveries': 0}
+                      'protection_retries': 0, 'fragment_recoveries': 0, 'retries': 0,
+                      'batch_requests': 0, 'fragment_cache_hits': 0, 'active_requests': 0,
+                      'request_seconds': 0.0, 'last_retry_code': ''}
+        self.last_activity_at = time.monotonic()
 
     def _count(self, name):
         with self.counter_lock:
             self.stats[name] += 1
+            self.last_activity_at = time.monotonic()
+
+    def snapshot(self):
+        """A consistent, credential-free view for the runner's heartbeat."""
+        with self.counter_lock:
+            return dict(self.stats, last_activity_seconds=round(max(0.0, time.monotonic() - self.last_activity_at), 2))
+
+    def _retry(self, code, seconds):
+        with self.counter_lock:
+            self.stats['retries'] += 1
+            self.stats['last_retry_code'] = str(code)
+            self.last_activity_at = time.monotonic()
+        self._pause(seconds)
+
+    def _pause(self, seconds):
+        # Stop promptly if another worker has detected invalid credentials or
+        # an exhausted quota, including during a rate-limit/backoff wait.
+        while seconds > 0:
+            self.raise_if_unavailable()
+            step = min(seconds, 0.25)
+            self.sleep(step)
+            seconds -= step
+        self.raise_if_unavailable()
+
+    def _post(self, endpoint, **kwargs):
+        self.raise_if_unavailable()
+        started = time.monotonic()
+        with self.counter_lock:
+            self.stats['requests'] += 1
+            self.stats['active_requests'] += 1
+            self.last_activity_at = started
+        try:
+            return self._session().post(endpoint, **kwargs)
+        finally:
+            with self.counter_lock:
+                self.stats['active_requests'] -= 1
+                self.stats['request_seconds'] += time.monotonic() - started
+                self.last_activity_at = time.monotonic()
 
     def raise_if_unavailable(self):
         with self.counter_lock:
@@ -207,12 +287,14 @@ class BaiduAcademicClient:
             raise BaiduAPIError(*fatal)
 
     def _wait_for_slot(self):
+        self.raise_if_unavailable()
         with self.rate_lock:
+            self.raise_if_unavailable()
             now = time.monotonic()
-            due = max(now, self.next_request_at)
-            self.next_request_at = due + 1 / self.config.qps
-        if due > now:
-            self.sleep(due - now)
+            # Only wait for the next actual send slot. Reserving slots for
+            # all workers ahead of time creates a long, uncancellable queue.
+            self._pause(max(0.0, self.next_request_at - now))
+            self.next_request_at = time.monotonic() + 1 / self.config.qps
 
     def _session(self):
         if not hasattr(self.local, 'session'):
@@ -221,9 +303,10 @@ class BaiduAcademicClient:
             self.local.session = session
         return self.local.session
 
-    def _request(self, query):
+    def _request(self, query, *, return_records=False, retry_coverage=True):
+        self.raise_if_unavailable()
         if self.config.service_mode == 'llm':
-            return self._request_llm(query)
+            return self._request_llm(query, return_records=return_records, retry_coverage=retry_coverage)
         if len(query.encode('utf-8')) > 6000:
             raise ValueError('百度学术 API 单次请求不能超过 6000 UTF-8 字节。')
         for attempt in range(4):
@@ -232,9 +315,8 @@ class BaiduAcademicClient:
             data = {'q': query, 'from': 'en', 'to': 'zh', 'appid': self.config.app_id,
                     'salt': salt, 'domain': 'academic',
                     'sign': make_sign(self.config.app_id, query, salt, self.config.secret)}
-            self._count('requests')
             try:
-                response = self._session().post(ENDPOINT, data=data, timeout=(10, 45))
+                response = self._post(ENDPOINT, data=data, timeout=(10, 45))
                 if response.status_code == 429 or response.status_code >= 500:
                     raise BaiduAPIError('HTTP_RETRY', '百度服务暂时繁忙')
                 if response.status_code != 200:
@@ -242,6 +324,8 @@ class BaiduAcademicClient:
                 result = response.json()
                 if 'error_code' in result:
                     raise BaiduAPIError(result['error_code'])
+                if return_records:
+                    return parse_complete_llm_response(result, query, return_records=True)
                 records = result.get('trans_result')
                 if not records or any(not isinstance(item.get('dst'), str) for item in records):
                     raise BaiduAPIError('INVALID_RESPONSE', '百度服务未返回有效译文')
@@ -249,15 +333,102 @@ class BaiduAcademicClient:
             except BaiduAPIError as error:
                 if attempt == 3 or error.code not in RETRY_CODES | {'HTTP_RETRY'}:
                     raise
+                retry_code = error.code
             except (requests.Timeout, requests.ConnectionError):
                 if attempt == 3:
                     raise BaiduAPIError('NETWORK', '无法连接百度学术翻译服务，请检查网络连接') from None
+                retry_code = 'NETWORK'
             except (ValueError, requests.RequestException):
                 raise BaiduAPIError('INVALID_RESPONSE', '百度服务响应无法解析，请稍后重试') from None
-            self.sleep(min(2 ** (attempt + 1), 8))
+            self._retry(retry_code, min(2 ** (attempt + 1), 8))
         raise BaiduAPIError('RETRY_EXHAUSTED')
 
-    def _request_llm(self, query):
+    def _fragment_cache_key(self, text):
+        # Plain spans contain no protected terms or formula placeholders and
+        # are translated without surrounding paragraph context. Their validated
+        # results can therefore be reused across papers and reviewed policies.
+        specification = ['baidu-desktop-plain-fragment-v1-source-coverage',
+                         self.config.service_mode, 'academic-style', 'en', 'zh', text]
+        return hashlib.sha256(json.dumps(specification, ensure_ascii=False).encode('utf-8')).hexdigest()
+
+    def _translate_fragment_batch(self, fragments):
+        self.raise_if_unavailable()
+        query = '\n'.join(fragments)
+        if len(fragments) > 1:
+            self._count('batch_requests')
+        try:
+            # Retry a transient network/service error normally, but a bad
+            # source mapping is structural: split it immediately instead of
+            # sending the same invalid batch three times.
+            records = self._request(query, return_records=True, retry_coverage=False)
+            results = align_fragment_records(records, fragments)
+            for fragment, result in zip(fragments, results):
+                self.protector.restore(result, {})
+                if (len(re.findall(r'[A-Za-z]+', fragment)) >= 3
+                        and not re.search(r'[\u3400-\u9fff]', result)):
+                    raise ProtectionError('片段恢复未生成有效中文译文，本段已拒绝。')
+            return results
+        except (BaiduAPIError, ProtectionError) as error:
+            structural = isinstance(error, ProtectionError) or error.code in {
+                'SOURCE_COVERAGE', 'BATCH_ALIGNMENT', 'EMPTY_TRANSLATION', 'INVALID_RESPONSE'}
+            if not structural or len(fragments) == 1:
+                raise
+            middle = len(fragments) // 2
+            return (self._translate_fragment_batch(fragments[:middle])
+                    + self._translate_fragment_batch(fragments[middle:]))
+
+    def _translate_fragments(self, chunk, *, ignore_cache=False):
+        # Markers never leave the computer during recovery: send only plain
+        # spans in a newline batch, then insert each marker at its exact local
+        # source position. There is no cap on the number of spans.
+        spans = TOKEN_RE.split(chunk)
+        markers = TOKEN_RE.findall(chunk)
+        unique = list(dict.fromkeys(span.strip() for span in spans if re.search(r'[A-Za-z]', span)))
+        translated = {}
+        pending = []
+        for span in unique:
+            cached = None if ignore_cache else self.cache.get(self._fragment_cache_key(span))
+            if cached is None:
+                pending.append(span)
+            else:
+                self.protector.restore(cached, {})
+                translated[span] = cached
+                self._count('fragment_cache_hits')
+        batch = []
+        batch_bytes = 0
+        for span in pending:
+            added = len(span.encode('utf-8')) + (1 if batch else 0)
+            if batch and batch_bytes + added > self.config.max_query_bytes:
+                translated.update(zip(batch, self._translate_fragment_batch(batch)))
+                batch = []
+                batch_bytes = 0
+                added -= 1
+            batch.append(span)
+            batch_bytes += added
+        if batch:
+            translated.update(zip(batch, self._translate_fragment_batch(batch)))
+        result = []
+        for index, span in enumerate(spans):
+            if re.search(r'[A-Za-z]', span):
+                leading = span[:len(span) - len(span.lstrip())]
+                trailing = span[len(span.rstrip()):]
+                result.append(leading + translated[span.strip()] + trailing)
+            else:
+                result.append(span)
+            if index < len(markers):
+                result.append(markers[index])
+        recovered = ''.join(result)
+        if (len(re.findall(r'[A-Za-z]+', ''.join(spans))) >= 3
+                and not re.search(r'[\u3400-\u9fff]', recovered)):
+            raise ProtectionError('片段恢复未生成有效中文译文，本段已拒绝。')
+        self.protector.restore(recovered, {marker: '' for marker in markers})
+        # Commit only after every span and the complete recovered chunk pass;
+        # failed/partial batches never leave reusable records behind.
+        self.cache.set_many([(self._fragment_cache_key(span), translated[span]) for span in pending])
+        self._count('fragment_recoveries')
+        return recovered
+
+    def _request_llm(self, query, *, return_records=False, retry_coverage=True):
         """Read every result from the same official endpoint as Baidu's CLI.
 
         trans-cli 1.1.2 exposes only the first trans_result record as
@@ -270,9 +441,8 @@ class BaiduAcademicClient:
         data = {'q': query, 'from': 'en', 'to': 'zh', 'reference': instruction}
         for attempt in range(3):
             self._wait_for_slot()
-            self._count('requests')
             try:
-                response = self._session().post(LLM_ENDPOINT,
+                response = self._post(LLM_ENDPOINT,
                     headers={'Authorization': 'Bearer ' + self.config.api_key},
                     json=data, timeout=(10, 75))
                 if response.status_code == 429 or response.status_code >= 500:
@@ -296,16 +466,21 @@ class BaiduAcademicClient:
                         detail = re.sub(r'[\r\n\t]+', ' ', detail)[:240]
                         logging.getLogger(__name__).warning('百度业务错误 30000: %s', detail or '服务未提供错误说明')
                     raise BaiduAPIError(payload['error_code'])
-                return parse_complete_llm_response(payload, query)
+                return parse_complete_llm_response(payload, query, return_records=return_records)
             except BaiduAPIError as error:
-                if attempt == 2 or error.code not in LLM_RETRY_CODES | {'HTTP_RETRY', 'SOURCE_COVERAGE'}:
+                retry_codes = LLM_RETRY_CODES | {'HTTP_RETRY'}
+                if retry_coverage:
+                    retry_codes = retry_codes | {'SOURCE_COVERAGE'}
+                if attempt == 2 or error.code not in retry_codes:
                     raise
+                retry_code = error.code
             except (requests.Timeout, requests.ConnectionError):
                 if attempt == 2:
                     raise BaiduAPIError('NETWORK_ERROR', '无法连接百度翻译，请检查网络') from None
+                retry_code = 'NETWORK_ERROR'
             except (ValueError, requests.RequestException):
                 raise BaiduAPIError('INVALID_RESPONSE', '百度未返回有效的文本译文') from None
-            self.sleep(2 ** (attempt + 1))
+            self._retry(retry_code, 2 ** (attempt + 1))
         raise BaiduAPIError('RETRY_EXHAUSTED')
 
     def translate(self, text, ignore_cache=False):
@@ -328,37 +503,6 @@ class BaiduAcademicClient:
                 return cached
 
         def translate_masked(masked):
-            def translate_fragments(chunk):
-                # Some LLMs infer that a placeholder represents a grammatical
-                # word (e.g. a user-protected "do") and legitimately omit it
-                # in Chinese. More retries cannot guarantee recovery. In this
-                # fallback the service never receives a placeholder:
-                # only unprotected spans are translated, and every protected
-                # token is inserted locally in its exact source position.
-                # Process every span rather than rejecting dense terminology;
-                # each request still uses the shared rate limiter and normal
-                # API validation/error handling.
-                spans = TOKEN_RE.split(chunk)
-                markers = TOKEN_RE.findall(chunk)
-                result = []
-                for index, span in enumerate(spans):
-                    if re.search(r'[A-Za-z]', span):
-                        leading = span[:len(span) - len(span.lstrip())]
-                        trailing = span[len(span.rstrip()):]
-                        translated = self._request(span.strip())
-                        self.protector.restore(translated, {})
-                        result.append(leading + translated.strip() + trailing)
-                    else:
-                        result.append(span)
-                    if index < len(markers):
-                        result.append(markers[index])
-                recovered = ''.join(result)
-                if (len(re.findall(r'[A-Za-z]+', ''.join(spans))) >= 3
-                        and not re.search(r'[\u3400-\u9fff]', recovered)):
-                    raise ProtectionError('片段恢复未生成有效中文译文，本段已拒绝。')
-                self._count('fragment_recoveries')
-                return recovered
-
             def validated_chunk(chunk):
                 # Validate each request separately, so a marker from one
                 # response cannot accidentally compensate for another's loss.
@@ -371,7 +515,7 @@ class BaiduAcademicClient:
                     if not mapping:
                         raise
                     self._count('protection_retries')
-                    recovered = translate_fragments(chunk)
+                    recovered = self._translate_fragments(chunk, ignore_cache=ignore_cache)
                     self.protector.restore(recovered, mapping)
                     return recovered
             return ' '.join(validated_chunk(chunk) for chunk in split_utf8(masked, self.config.max_query_bytes))

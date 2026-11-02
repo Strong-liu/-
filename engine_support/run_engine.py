@@ -10,7 +10,9 @@ import math
 import multiprocessing
 import os
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 try:
@@ -23,8 +25,49 @@ except ImportError:
     from term_protection import POLICY_VERSION, TermProtector, discover_protected_terms, load_policy
 
 
+_event_lock = threading.Lock()
+
+
 def emit(event):
-    print('PDFMT_EVENT ' + json.dumps(event, ensure_ascii=False, default=str), flush=True)
+    with _event_lock:
+        print('PDFMT_EVENT ' + json.dumps(event, ensure_ascii=False, default=str), flush=True)
+
+
+def translation_workers(config):
+    # QPS controls request starts, not the number of slow responses in flight.
+    # Overlap network waits while the client's shared limiter keeps its quota.
+    return min(16, max(4, math.ceil(config.qps * 8)))
+
+
+@contextmanager
+def backend_telemetry(client, interval=5):
+    started = time.monotonic()
+    last_progress = [started]
+    stopped = threading.Event()
+
+    def progress():
+        last_progress[0] = time.monotonic()
+
+    def report():
+        while not stopped.is_set():
+            snapshot = client.snapshot()
+            now = time.monotonic()
+            emit({'type': 'telemetry', 'stats': snapshot,
+                  'active_requests': snapshot.get('active_requests', 0),
+                  'last_activity_seconds': round(min(snapshot.get('last_activity_seconds', 0), now - last_progress[0]), 2),
+                  'elapsed_seconds': round(now - started, 2),
+                  'retries': snapshot.get('retries', 0),
+                  'last_retry_code': snapshot.get('last_retry_code')})
+            if stopped.wait(interval):
+                break
+
+    thread = threading.Thread(target=report, name='translation-heartbeat', daemon=True)
+    thread.start()
+    try:
+        yield progress
+    finally:
+        stopped.set()
+        thread.join(timeout=2)
 
 
 def engine_path(explicit=None):
@@ -126,7 +169,7 @@ async def translate(args, config):
     settings = SettingsModel(
         basic=BasicSettings(input_files={str(args.input)}),
         translation=TranslationSettings(lang_in='en', lang_out='zh-CN', output=str(args.output),
-                                        qps=max(1, math.ceil(config.qps)), pool_max_workers=2,
+                                        qps=max(1, math.ceil(config.qps)), pool_max_workers=translation_workers(config),
                                         no_auto_extract_glossary=True),
         pdf=PDFSettings(dual_translate_first=True, disable_rich_text_translate=True,
                         watermark_output_mode='no_watermark', translate_table_text=False),
@@ -143,16 +186,18 @@ async def translate(args, config):
     logging.getLogger().addHandler(error_counter)
     started = time.monotonic()
     emit({'type': 'backend', 'backend': 'baidu-' + config.service_mode, 'domain': 'academic-style' if config.service_mode == 'llm' else 'academic',
-          'app_version': '0.3.1', 'protected_term_count': len(client.protector.terms),
+          'app_version': '0.3.2', 'protected_term_count': len(client.protector.terms),
+          'pool_max_workers': translation_workers(config), 'qps': config.qps,
           'preserve_references': client.protector.preserve_references})
     try:
         babel_config = high_level.create_babeldoc_config(settings, args.input)
         finished = False
-        with preserve_original_paragraphs(
+        with backend_telemetry(client) as progress, preserve_original_paragraphs(
             ILTranslator, babel_config, client.protector,
             on_preserved=lambda: client._count('preserved_paragraphs'),
         ):
             async for event in async_translate(babel_config):
+                progress()
                 kind = event.get('type')
                 if kind == 'error':
                     raise RuntimeError(str(event.get('error', 'PDF 引擎处理失败。')))

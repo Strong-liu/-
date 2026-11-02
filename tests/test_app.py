@@ -141,6 +141,7 @@ class DesktopAPITests(unittest.TestCase):
 
     def test_status_update_failure_terminates_owned_translator(self):
         job = self.upload_fixture()
+        application.manager.update(job['id'], status='queued')
         process = Mock()
         process.stdout = io.StringIO('PDFMT_EVENT {"type":"progress_start","stage":"Subset font"}\n')
         original_update = application.manager.update
@@ -159,6 +160,124 @@ class DesktopAPITests(unittest.TestCase):
         terminate.assert_called_once_with(process)
         self.assertEqual(application.manager.items[job['id']]['status'], 'failed')
         self.assertTrue(process.stdout.closed)
+
+    def test_engine_telemetry_and_progress_survive_failure_and_reload(self):
+        job = self.upload_fixture()
+        application.manager.update(job['id'], status='queued')
+        process = Mock(returncode=1)
+        process.stdout = io.StringIO(
+            'PDFMT_EVENT {"type":"progress_update","stage":"Translate Paragraphs","stage_current":48,"stage_total":496,"overall_progress":43.05}\n'
+            'PDFMT_EVENT {"type":"telemetry","stats":{"requests":76,"cache_hits":12,"translated_paragraphs":48},"active_requests":1,"retries":4,"last_retry_code":"30000","elapsed_seconds":650}\n'
+            'PDFMT_EVENT {"type":"error","error":"upstream unavailable"}\n')
+        with patch.object(application, 'prepare_assets'), \
+                patch.object(application.settings, 'credentials', return_value={'BAIDU_API_KEY': 'fake-test-only'}), \
+                patch.object(application.subprocess, 'Popen', return_value=process):
+            application.manager.run(job['id'])
+        result = self.client.get(f'/api/jobs/{job["id"]}').json()
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual((result['stage_current'], result['stage_total']), (48, 496))
+        self.assertEqual(result['telemetry']['requests'], 76)
+        self.assertEqual(result['telemetry']['retries'], 4)
+        self.assertEqual(result['telemetry']['last_retry_code'], '30000')
+        saved = json.loads((application.JOBS / job['id'] / 'job.json').read_text(encoding='utf-8'))
+        self.assertEqual(saved['telemetry'], result['telemetry'])
+
+    def test_cancelled_queued_job_never_starts_a_process_and_can_retry(self):
+        job = self.upload_fixture()
+        application.manager.update(job['id'], status='queued')
+        response = self.client.post(f'/api/jobs/{job["id"]}/cancel')
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(response.json()['phase'], 'cancelled')
+        with patch.object(application.subprocess, 'Popen') as spawn:
+            application.manager.run(job['id'])
+        spawn.assert_not_called()
+        with patch.object(application.settings, 'credentials', return_value={'BAIDU_API_KEY': 'fake-test-only'}), \
+                patch.object(application.manager.executor, 'submit'):
+            retried = self.client.post(f'/api/jobs/{job["id"]}/retry')
+        self.assertEqual(retried.status_code, 202, retried.text)
+        self.assertEqual(retried.json()['status'], 'queued')
+
+    def test_cancel_other_queued_job_never_kills_active_process(self):
+        job = self.upload_fixture()
+        application.manager.update(job['id'], status='queued')
+        process = Mock()
+        with patch.object(application.manager, 'process', process), \
+                patch.object(application.manager, 'process_job_id', 'another-task'), \
+                patch.object(application, 'kill_owned_process') as terminate:
+            response = self.client.post(f'/api/jobs/{job["id"]}/cancel')
+        self.assertEqual(response.status_code, 202, response.text)
+        terminate.assert_not_called()
+
+    def test_cancel_running_task_kills_only_its_owned_process(self):
+        job = self.upload_fixture()
+        application.manager.update(job['id'], status='running')
+        process = Mock()
+        with patch.object(application.manager, 'process', process), \
+                patch.object(application.manager, 'process_job_id', job['id']), \
+                patch.object(application, 'kill_owned_process') as terminate:
+            response = self.client.post(f'/api/jobs/{job["id"]}/cancel')
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(response.json()['phase'], 'cancelling')
+        terminate.assert_called_once_with(process)
+        application.manager.cancel_requested.discard(job['id'])
+
+    def test_watchdog_uses_silence_instead_of_total_runtime(self):
+        process = Mock()
+        process.poll.return_value = None
+        with patch.object(application.time, 'monotonic', return_value=100):
+            watchdog = application.EngineWatchdog(process, silence_seconds=180)
+        with patch.object(application.time, 'monotonic', return_value=7300):
+            watchdog.touch()
+        with patch.object(application.time, 'monotonic', return_value=7479), \
+                patch.object(application, 'kill_owned_process') as terminate:
+            self.assertFalse(watchdog.check())
+            terminate.assert_not_called()
+        with patch.object(application.time, 'monotonic', return_value=7480), \
+                patch.object(application, 'kill_owned_process') as terminate:
+            self.assertTrue(watchdog.check())
+            terminate.assert_called_once_with(process)
+        self.assertTrue(watchdog.timed_out.is_set())
+
+    def test_idle_telemetry_stops_engine_with_clear_error(self):
+        job = self.upload_fixture()
+        application.manager.update(job['id'], status='queued')
+        process = Mock(returncode=1)
+        process.stdout = io.StringIO('PDFMT_EVENT {"type":"telemetry","last_activity_seconds":300,"active_requests":0}\n')
+        with patch.object(application, 'prepare_assets'), \
+                patch.object(application.settings, 'credentials', return_value={'BAIDU_API_KEY': 'fake-test-only'}), \
+                patch.object(application.subprocess, 'Popen', return_value=process), \
+                patch.object(application, 'kill_owned_process') as terminate:
+            application.manager.run(job['id'])
+        terminate.assert_called_once_with(process)
+        saved = application.manager.items[job['id']]
+        self.assertEqual(saved['status'], 'failed')
+        self.assertIn('5 分钟', saved['message'])
+        self.assertIn('缓存会保留', saved['message'])
+
+    def test_cancellation_during_preparation_never_starts_engine(self):
+        job = self.upload_fixture()
+        application.manager.update(job['id'], status='queued')
+        with patch.object(application, 'prepare_assets', side_effect=lambda: application.manager.cancel(job['id'])), \
+                patch.object(application.settings, 'credentials', return_value={'BAIDU_API_KEY': 'fake-test-only'}), \
+                patch.object(application.subprocess, 'Popen') as spawn:
+            application.manager.run(job['id'])
+        spawn.assert_not_called()
+        self.assertEqual(application.manager.items[job['id']]['phase'], 'cancelled')
+
+    def test_heartbeat_silence_timeout_is_reported_as_timeout(self):
+        job = self.upload_fixture()
+        application.manager.update(job['id'], status='queued')
+        process = Mock(returncode=-1)
+        process.stdout = io.StringIO('')
+        with patch.object(application, 'prepare_assets'), \
+                patch.object(application.settings, 'credentials', return_value={'BAIDU_API_KEY': 'fake-test-only'}), \
+                patch.object(application.subprocess, 'Popen', return_value=process), \
+                patch.object(application, 'EngineWatchdog') as monitor, \
+                patch.object(application, 'kill_owned_process'):
+            monitor.return_value.timed_out.is_set.return_value = True
+            application.manager.run(job['id'])
+        self.assertEqual(application.manager.items[job['id']]['status'], 'failed')
+        self.assertIn('180 秒没有心跳', application.manager.items[job['id']]['message'])
 
 
 if __name__ == '__main__':

@@ -10,6 +10,7 @@ const ui = {
 const statusNames = {review:'待核对术语',queued:'排队中',running:'正在翻译',succeeded:'已完成',failed:'需要重试'};
 const phaseNames = {
   preparing:'正在准备内置资源',queued:'等待处理',review:'核对英文术语',finished:'翻译完成',failed:'处理未完成',
+  cancelling:'正在停止翻译',cancelled:'已取消翻译',
   'Parse PDF and Create Intermediate Representation':'解析 PDF',DetectScannedFile:'检测扫描页面',
   'Parse Page Layout':'分析版面','Parse Paragraphs':'识别段落','Parse Formulas and Styles':'识别公式和样式',
   'Translate Paragraphs':'翻译段落',Typesetting:'重新排版','Add Fonts':'嵌入字体',
@@ -27,14 +28,21 @@ function showMessage(element, message, error=false) {
 }
 
 async function request(url, options={}) {
-  const response = await fetch(url, options);
-  let data;
-  try {data=await response.json();} catch {throw new Error('本地服务未返回有效结果，请重新打开软件。');}
-  if(!response.ok) {
-    const detail=typeof data.detail==='string' ? data.detail : Array.isArray(data.detail) ? data.detail.map(item=>item.msg).join('；') : '请求未完成，请稍后重试。';
-    throw new Error(detail);
-  }
-  return data;
+  const controller = new AbortController();
+  const {timeoutMs=300000,...fetchOptions}=options;
+  const timer=setTimeout(()=>controller.abort(),timeoutMs);
+  try {
+    const response = await fetch(url, {...fetchOptions,signal:controller.signal});
+    let data;
+    try {data=await response.json();}
+    catch(error) {if(error.name==='AbortError') throw error;throw new Error('本地服务未返回有效结果，请重新打开软件。');}
+    if(!response.ok) {
+      const detail=typeof data.detail==='string' ? data.detail : Array.isArray(data.detail) ? data.detail.map(item=>item.msg).join('；') : '请求未完成，请稍后重试。';
+      throw new Error(detail);
+    }
+    return data;
+  } catch(error) {if(error.name==='AbortError') throw new Error('本地服务响应超时，请稍后重试。');throw error;}
+  finally {clearTimeout(timer);}
 }
 
 function jsonRequest(url, method, data) {
@@ -211,6 +219,17 @@ function createCard(job) {
   if(job.status==='failed') {
     element.querySelector('.job-actions').append(createLink(`/api/jobs/${job.id}/log`,'运行日志',true));
   }
+  if(['running','queued'].includes(job.status)) {
+    const cancel=document.createElement('button');cancel.type='button';cancel.className='secondary-button cancel-job';
+    cancel.addEventListener('click',async()=>{
+      card.pending=true;updateCard(card,card.job);
+      try {await jsonRequest(`/api/jobs/${job.id}/cancel`,'POST',{});await refresh();}
+      catch(error) {showMessage(element.querySelector('.job-action-message'),error.message,true);}
+      finally {card.pending=false;updateCard(card,card.job);}
+    });
+    element.querySelector('.job-actions').append(cancel);
+    if(job.status==='running') element.querySelector('.job-actions').append(createLink(`/api/jobs/${job.id}/log`,'运行日志',true));
+  }
   if(job.status==='succeeded' && job.downloads) {
     element.querySelector('.job-actions').append(createLink(job.downloads.mono,'下载中文 PDF'),createLink(job.downloads.dual,'下载中英对照 PDF'));
   }
@@ -222,14 +241,39 @@ function updateCard(card,job) {
   const element=card.element;
   element.className=`job-card ${job.status}`;
   element.querySelector('h3').textContent=job.name;
-  const badge=element.querySelector('.status-badge');badge.className=`status-badge ${job.status}`;badge.textContent=statusNames[job.status] || job.status;
+  const badge=element.querySelector('.status-badge');badge.className=`status-badge ${job.status}`;badge.textContent=job.phase==='cancelled'?'已取消':statusNames[job.status] || job.status;
   const date=new Date(job.created_at*1000).toLocaleString('zh-CN');
   element.querySelector('.job-meta').textContent=`${job.pages} 页 · ${(job.bytes/1024/1024).toFixed(2)} MB · ${date}${elapsed(job)?' · 已用时 '+elapsed(job):''}`;
   let message=job.message || '';
   if(job.status==='queued') message=`排队中${job.queue_position?'：第 '+job.queue_position+' 个':''}，轮到这篇论文时会自动处理。`;
-  if(job.status==='running' && phaseNames[job.phase]) message=phaseNames[job.phase]+'……';
+  if(job.status==='running' && phaseNames[job.phase]) {
+    message=phaseNames[job.phase];
+    if(Number.isFinite(job.stage_current) && Number.isFinite(job.stage_total) && job.stage_total>0 && job.phase!=='cancelling') {
+      message+=`：${job.stage_current} / ${job.stage_total} ${job.phase==='Translate Paragraphs'?'段':'项'}`;
+    } else message+='……';
+  }
   element.querySelector('.job-message').textContent=message;
-  element.querySelector('.progress-track').hidden=job.status!=='running';
+  const telemetry=job.telemetry || {};
+  const statistics=[];
+  if(job.status==='running' && Number.isFinite(job.overall_progress)) statistics.push(`总进度 ${Math.round(Math.min(100,Math.max(0,job.overall_progress)))}%`);
+  if(Number.isFinite(telemetry.requests)) statistics.push(`请求 ${telemetry.requests} 次`);
+  if(Number.isFinite(telemetry.cache_hits)) statistics.push(`复用缓存 ${telemetry.cache_hits} 段`);
+  if(Number.isFinite(telemetry.preserved_paragraphs)) statistics.push(`保留原文 ${telemetry.preserved_paragraphs} 段`);
+  if(telemetry.retries>0) statistics.push(`服务重试 ${telemetry.retries} 次${telemetry.last_retry_code?'（'+telemetry.last_retry_code+'）':''}`);
+  if(job.status==='running' && job.phase!=='cancelling') {
+    if(telemetry.active_requests>0) statistics.push(`百度处理中 ${telemetry.active_requests} 个请求`);
+    if(telemetry.last_activity_seconds>=30) statistics.push(`最近处理进展在 ${Math.floor(telemetry.last_activity_seconds)} 秒前`);
+    if(String(telemetry.last_retry_code)==='30000') statistics.push('本次曾遇百度 AI 服务暂时异常');
+  }
+  const details=element.querySelector('.job-statistics');details.textContent=statistics.join(' · ');details.hidden=!statistics.length;
+  const track=element.querySelector('.progress-track');track.hidden=job.status!=='running';
+  const progress=Number.isFinite(job.overall_progress)?Math.min(100,Math.max(0,job.overall_progress)):null;
+  track.classList.toggle('determinate',progress!==null);
+  track.firstElementChild.style.width=progress===null?'':`${progress}%`;
+  track.setAttribute('aria-label',progress===null?'正在处理':`总进度 ${Math.round(progress)}%`);
+  if(progress===null) track.removeAttribute('aria-valuenow');else track.setAttribute('aria-valuenow',String(Math.round(progress)));
+  const cancel=element.querySelector('.cancel-job');
+  if(cancel) {cancel.disabled=card.pending || job.phase==='cancelling';cancel.textContent=card.pending || job.phase==='cancelling'?'正在停止……':job.status==='queued'?'取消排队':'停止翻译';}
   const start=element.querySelector('.start-translation');
   if(start) {start.disabled=card.pending || !ui.configured;start.textContent=card.pending?'正在加入队列……':job.status==='failed'?'调整完成，重新翻译':'核对完成，开始翻译';}
   const retry=element.querySelector('.retry-job');if(retry) retry.disabled=card.pending;
@@ -261,7 +305,7 @@ function render(jobs) {
 async function refresh() {
   if(ui.refreshing) return;
   ui.refreshing=true;
-  try {render(await request('/api/jobs'));document.querySelector('#connection-message').textContent='';}
+  try {render(await request('/api/jobs',{timeoutMs:15000}));document.querySelector('#connection-message').textContent='';}
   catch(error) {document.querySelector('#connection-message').textContent='本地服务暂未连接。请从开始菜单或桌面重新打开“橙意翻译助手”。';}
   finally {ui.refreshing=false;}
 }

@@ -7,8 +7,8 @@
   <title>橙意翻译助手 · 论文 PDF 翻译</title>
   <link rel="icon" type="image/x-icon" href="/static/branding/app.ico">
   <link rel="apple-touch-icon" href="/static/branding/app-icon.png">
-  <link rel="stylesheet" href="/static/style.css">
-  <script src="/static/app.js" defer></script>
+  <link rel="stylesheet" href="/static/style.css?v=0.3.2">
+  <script src="/static/app.js?v=0.3.2" defer></script>
 </head>
 <body>
   <main>
@@ -66,7 +66,7 @@
       <div id="jobs"><div class="empty-state"><strong>从第一篇论文开始</strong><p>上传后会在这里显示术语清单、处理状态和下载文件。</p></div></div>
       <p id="connection-message" class="connection-message" role="status" aria-live="polite"></p>
     </section>
-    <footer><span>PDFMathTranslate · BabelDOC · 百度翻译开放平台</span><a href="https://github.com/Strong-liu/-" target="_blank" rel="noopener noreferrer">GitHub 开源项目</a><span>中文译文在左，英文原文在右</span></footer>
+    <footer><span>v0.3.2 · PDFMathTranslate · BabelDOC · 百度翻译开放平台</span><a href="https://github.com/Strong-liu/-" target="_blank" rel="noopener noreferrer">GitHub 开源项目</a><span>中文译文在左，英文原文在右</span></footer>
   </main>
   <template id="job-template">
     <article class="job-card">
@@ -74,7 +74,8 @@
       <div class="job-main">
         <div class="job-header"><h3></h3><span class="status-badge"></span></div>
         <div class="job-meta"></div><p class="job-message" role="status"></p>
-        <div class="progress-track" hidden><div></div></div>
+        <p class="job-statistics" hidden></p>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" hidden><div></div></div>
         <div class="review-panel" hidden>
           <div class="review-heading"><span>保留英文的词条</span><span class="term-count"></span></div>
           <div class="term-groups"></div>
